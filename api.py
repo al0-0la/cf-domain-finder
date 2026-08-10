@@ -1,47 +1,104 @@
 import requests
+import asyncio
+import socket
 
 from config import API_URL
+from config import STATIC_DOMAINS
 
 
-def fetch_vps789_domains():
+def get_candidate_domains():
+
+    domains = {}
+
+    #
+    # 静态域名
+    #
+
+    for domain in STATIC_DOMAINS:
+
+        domains[domain] = {
+            "domain": domain,
+            "source": "static",
+            "avgScore": None,
+            "avgLatency": None,
+            "avgLoss": None,
+        }
+
+    #
+    # VPS789
+    #
 
     try:
 
-        headers = {
-            "User-Agent": "Mozilla/5.0"
-        }
-
         response = requests.get(
             API_URL,
-            headers=headers,
             timeout=10
         )
 
         response.raise_for_status()
 
-        data = response.json()
-
-        goods = data.get("data", {}).get("good", [])
-
-        domains = []
+        goods = (
+            response.json()
+            .get("data", {})
+            .get("good", [])
+        )
 
         for item in goods:
 
-            domain = (
-                item.get("domain")
-                or item.get("host")
-                or item.get("hostname")
-            )
+            domain = item.get("ip")
 
-            if domain:
-                domains.append(domain)
+            if not domain:
+                continue
 
-        return list(set(domains))
+            domains[domain] = {
+                "domain": domain,
+                "source": "vps789",
+                "avgScore": item.get("avgScore"),
+                "avgLatency": item.get("avgLatency"),
+                "avgLoss": item.get("avgPkgLostRate"),
+            }
 
     except Exception as e:
 
         print(
-            f"[API] VPS789获取失败: {e}"
+            f"[API ERROR] {e}"
         )
+
+    return list(domains.values())
+
+
+async def resolve_domain(domain):
+
+    try:
+
+        proc = await asyncio.create_subprocess_exec(
+            "dig",
+            "+short",
+            domain,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, _ = await proc.communicate()
+
+        ips = []
+
+        for line in stdout.decode().splitlines():
+
+            ip = line.strip()
+
+            try:
+
+                socket.inet_aton(ip)
+
+                ips.append(ip)
+
+            except Exception:
+
+                pass
+
+        return ips
+
+    except Exception:
 
         return []
