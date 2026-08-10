@@ -1,3 +1,389 @@
+import asyncio
+import csv
+from collections import defaultdict
+import os
+from config import *
+from api import *
+
+
+def parse_trace(text):
+
+    result = {}
+
+    for line in text.splitlines():
+
+        if "=" not in line:
+            continue
+
+        k, v = line.split("=", 1)
+
+        result[k] = v
+
+    return result
+
+
+async def test_ip(
+    source_domain,
+    meta,
+    ip,
+    sem
+):
+
+    async with sem:
+
+        try:
+
+            cmd = [
+                "curl",
+                "-s",
+                "-o",
+                "-",
+                "-w",
+                "\n__TTFB__:%{time_starttransfer}",
+
+                "--connect-timeout",
+                str(CONNECT_TIMEOUT),
+
+                "--max-time",
+                str(MAX_TIME),
+
+                "--resolve",
+                f"{TARGET_DOMAIN}:443:{ip}",
+
+                f"https://{TARGET_DOMAIN}/cdn-cgi/trace"
+            ]
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            stdout, _ = await proc.communicate()
+
+            output = stdout.decode(
+                errors="ignore"
+            )
+
+            if "__TTFB__:" not in output:
+
+                return {
+                    **meta,
+                    "tested_ip": ip,
+                    "success": False,
+                    "colo": "",
+                    "ttfb": ""
+                }
+
+            trace_text, ttfb_text = output.rsplit(
+                "__TTFB__:",
+                1
+            )
+
+            trace = parse_trace(
+                trace_text
+            )
+
+            colo = trace.get(
+                "colo"
+            )
+
+            if not colo:
+
+                return {
+                    **meta,
+                    "tested_ip": ip,
+                    "success": False,
+                    "colo": "",
+                    "ttfb": ""
+                }
+
+            return {
+                **meta,
+                "tested_ip": ip,
+                "success": True,
+                "colo": colo,
+                "ttfb": float(ttfb_text.strip())
+            }
+
+        except Exception:
+
+            return {
+                **meta,
+                "tested_ip": ip,
+                "success": False,
+                "colo": "",
+                "ttfb": ""
+            }
+
+
+async def main():
+    os.makedirs("output", exist_ok=True)
+    domains = get_candidate_domains()
+
+    print(
+        f"获取域名数量: {len(domains)}"
+    )
+
+    sem = asyncio.Semaphore(
+        MAX_CONCURRENT
+    )
+
+    tasks = []
+
+    print("DNS解析...")
+
+    for item in domains:
+
+        dns_ips = await resolve_domain(
+            item["domain"]
+        )
+
+        for ip in dns_ips:
+
+            tasks.append(
+                test_ip(
+                    item["domain"],
+                    item,
+                    ip,
+                    sem
+                )
+            )
+
+    print(
+        f"开始测试 {len(tasks)} 个IP"
+    )
+
+    results = []
+
+    for task in asyncio.as_completed(tasks):
+
+        result = await task
+
+        results.append(result)
+
+        if result["success"]:
+
+            print(
+                f"[OK] "
+                f"{result['domain']} "
+                f"{result['tested_ip']} "
+                f"{result['colo']} "
+                f"{result['ttfb']}"
+            )
+
+    #
+    # Detail CSV
+    #
+
+    with open(
+        "output/test_detail.csv",
+        "w",
+        newline="",
+        encoding="utf-8"
+    ) as f:
+
+        writer = csv.writer(f)
+
+        writer.writerow([
+            "domain",
+            "source",
+            "api_score",
+            "api_latency",
+            "api_loss",
+            "tested_ip",
+            "success",
+            "colo",
+            "ttfb"
+        ])
+
+        for r in results:
+
+            writer.writerow([
+                r["domain"],
+                r["source"],
+                r["avgScore"],
+                r["avgLatency"],
+                r["avgLoss"],
+                r["tested_ip"],
+                r["success"],
+                r["colo"],
+                r["ttfb"],
+            ])
+
+    #
+    # 汇总
+    #
+
+    stat = defaultdict(
+        lambda: {
+            "source": "",
+            "score": None,
+            "latency": None,
+            "loss": None,
+
+            "total": 0,
+            "success": 0,
+            "fail": 0,
+
+            "ttfb_sum": 0,
+            "best_ttfb": 999
+        }
+    )
+
+    for r in results:
+
+        row = stat[r["domain"]]
+
+        row["source"] = r["source"]
+        row["score"] = r["avgScore"]
+        row["latency"] = r["avgLatency"]
+        row["loss"] = r["avgLoss"]
+
+        row["total"] += 1
+
+        if r["success"]:
+
+            row["success"] += 1
+
+            row["ttfb_sum"] += r["ttfb"]
+
+            row["best_ttfb"] = min(
+                row["best_ttfb"],
+                r["ttfb"]
+            )
+
+        else:
+
+            row["fail"] += 1
+
+    ranks = []
+
+    for domain, s in stat.items():
+
+        success_rate = (
+            s["success"] /
+            s["total"] * 100
+            if s["total"]
+            else 0
+        )
+
+        avg_ttfb = (
+            s["ttfb_sum"] /
+            s["success"]
+            if s["success"]
+            else 999
+        )
+
+        ranks.append({
+            "domain": domain,
+            "source": s["source"],
+            "success_rate": round(
+                success_rate,
+                2
+            ),
+            "avg_ttfb": round(
+                avg_ttfb,
+                4
+            ),
+            "total": s["total"],
+            "success": s["success"],
+            "fail": s["fail"],
+            "api_score": s["score"],
+            "api_latency": s["latency"],
+            "api_loss": s["loss"],
+            "best_ttfb": (
+                round(
+                    s["best_ttfb"],
+                    4
+                )
+                if s["best_ttfb"] != 999
+                else ""
+            )
+        })
+
+    ranks.sort(
+        key=lambda x: (
+            -x["success_rate"],
+            x["avg_ttfb"]
+        )
+    )
+
+    with open(
+        "output/domain_rank.csv",
+        "w",
+        newline="",
+        encoding="utf-8"
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=ranks[0].keys()
+        )
+
+        writer.writeheader()
+
+        writer.writerows(
+            ranks
+        )
+
+    #
+    # 输出结果
+    #
+
+    fail_worst = max(
+        ranks,
+        key=lambda x: x["fail"]
+    )
+
+    perfect = [
+        x
+        for x in ranks
+        if x["fail"] == 0
+        and x["success"] > 0
+    ]
+
+    print()
+
+    print("=" * 60)
+    print("失败率最高域名")
+    print("=" * 60)
+
+    print(fail_worst)
+
+    print()
+
+    print("=" * 60)
+    print("100%成功且最快")
+    print("=" * 60)
+
+    if perfect:
+
+        best = min(
+            perfect,
+            key=lambda x: x["avg_ttfb"]
+        )
+
+        print(best)
+
+    print()
+
+    print("=" * 60)
+    print("TOP10")
+    print("=" * 60)
+
+    for row in ranks[:10]:
+
+        print(
+            row["domain"],
+            row["success_rate"],
+            row["avg_ttfb"]
+        )
+
+
+if __name__ == "__main__":
+
+    asyncio.run(main())
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
