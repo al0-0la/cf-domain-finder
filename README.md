@@ -130,7 +130,16 @@ TARGET_DOMAIN = "monitor.example.com"
 ```
 
 ---
+## 数据来源
 
+### 本地配置
+
+config.py
+
+```python
+CF_SELECT_DOMAINS
+CF_OFFICE_DOMAINS
+---
 ## 运行
 
 ```bash
